@@ -1,0 +1,301 @@
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+from typing import Dict, List, Literal, Optional, Tuple
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+
+AssemblyMode = Literal[+1, -1]
+LegName = Literal["FL", "FR", "RL", "RR"]
+
+
+@dataclass(frozen=True)
+class LinkageParams:
+    a: float
+    b: float
+    c: float
+    d: float
+    l: float = 1.0
+
+
+def point_A(phi: np.ndarray, p: LinkageParams) -> np.ndarray:
+    phi = np.asarray(phi)
+    return np.column_stack([p.a * np.cos(phi), p.a * np.sin(phi)])
+
+
+def circle_circle_B(
+    phi: np.ndarray,
+    p: LinkageParams,
+    branch: AssemblyMode = +1,
+    eps: float = 1e-9,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    phi = np.asarray(phi)
+    Op = np.array([p.l, 0.0])
+    A = point_A(phi, p)
+
+    Delta = A - Op
+    r = np.linalg.norm(Delta, axis=1)
+    r = np.maximum(r, eps)
+
+    ex = Delta / r[:, None]
+    ey = np.column_stack([-ex[:, 1], ex[:, 0]])
+
+    alpha = (p.b * p.b - p.c * p.c + r * r) / (2.0 * r)
+    radicand = p.b * p.b - alpha * alpha
+    beta = float(branch) * np.sqrt(np.maximum(radicand, 0.0))
+
+    B = Op + alpha[:, None] * ex + beta[:, None] * ey
+    return A, B, radicand
+
+
+def point_C(phi: np.ndarray, p: LinkageParams, branch: AssemblyMode = +1) -> np.ndarray:
+    A, B, _ = circle_circle_B(phi, p, branch=branch)
+    return B + (p.d / p.c) * (B - A)
+
+
+def _close_gaps_circular(mask: np.ndarray, max_gap: int) -> np.ndarray:
+    mask = np.asarray(mask, dtype=bool)
+    n = mask.size
+    if n == 0:
+        return mask
+    ext = np.concatenate([mask, mask, mask])
+    start, end = n, 2 * n
+    i = start
+    while i < end:
+        if not ext[i]:
+            j = i
+            while j < end and not ext[j]:
+                j += 1
+            gap = j - i
+            if ext[i - 1] and (j < ext.size and ext[j]) and gap <= max_gap:
+                ext[i:j] = True
+            i = j
+        else:
+            i += 1
+    return ext[start:end]
+
+
+def _longest_true_segment_circular(mask: np.ndarray) -> Tuple[int, int]:
+    mask = np.asarray(mask, dtype=bool)
+    n = mask.size
+    if n == 0:
+        return 0, 0
+    mask2 = np.concatenate([mask, mask])
+    best_len = best_start = 0
+    cur_len = 0
+    cur_start = 0
+    for i, v in enumerate(mask2):
+        if v:
+            if cur_len == 0:
+                cur_start = i
+            cur_len += 1
+            if cur_len > best_len and cur_start < n and (i - cur_start) < n:
+                best_len = cur_len
+                best_start = cur_start
+        else:
+            cur_len = 0
+    return int(best_start), int(best_len)
+
+
+@dataclass(frozen=True)
+class Cycle:
+    phis: np.ndarray
+    B: np.ndarray
+    C: np.ndarray
+    stance: np.ndarray
+
+
+def precompute_cycle(
+    p: LinkageParams,
+    *,
+    branch: AssemblyMode = +1,
+    N: int = 2500,
+    tol_frac: float = 0.03,
+    gap_frac: float = 0.03,
+) -> Cycle:
+    phis = np.linspace(0.0, 2.0 * np.pi, N, endpoint=False)
+    _, B, _ = circle_circle_B(phis, p, branch=branch)
+    C = point_C(phis, p, branch=branch)
+
+    B = B * np.array([1.0, -1.0])
+    C = C * np.array([1.0, -1.0])
+
+    y_min = float(C[:, 1].min())
+    B = B - np.array([0.0, y_min])
+    C = C - np.array([0.0, y_min])
+
+    y_max = float(C[:, 1].max())
+    eps = tol_frac * (y_max - 0.0) + 1e-12
+
+    mask = C[:, 1] <= eps
+    mask = _close_gaps_circular(mask, max_gap=int(gap_frac * N))
+    start, length = _longest_true_segment_circular(mask)
+    idx = (np.arange(start, start + length) % N).astype(int)
+
+    stance = np.zeros(N, dtype=bool)
+    stance[idx] = True
+
+    return Cycle(phis=phis, B=B, C=C, stance=stance)
+
+
+def lookup(cyc: Cycle, phi: float) -> Tuple[np.ndarray, np.ndarray, bool]:
+    N = cyc.phis.size
+    phi = phi % (2.0 * np.pi)
+    k = int((phi / (2.0 * np.pi)) * N) % N
+    return cyc.B[k], cyc.C[k], bool(cyc.stance[k])
+
+
+@dataclass(frozen=True)
+class QuadConfig:
+    p: LinkageParams
+    cyc: Cycle
+    mount: Dict[LegName, np.ndarray]
+    phase: Dict[LegName, float]
+    com_base: float
+    com_bob_gain: float
+
+
+@dataclass
+class QuadSim:
+    t: np.ndarray
+    body_x: np.ndarray
+    com_xy: np.ndarray
+    B_world: Dict[LegName, np.ndarray]
+
+
+def make_quad(p: LinkageParams, *, gait: str = "walk", branch: AssemblyMode = +1, Ncycle: int = 2500) -> QuadConfig:
+    cyc = precompute_cycle(p, branch=branch, N=Ncycle)
+
+    L = 3.0 * p.l
+    ysep = 0.10 * p.l
+    mount = {
+        "FL": np.array([+0.45 * L, 0.0]),
+        "FR": np.array([+0.45 * L, ysep]),
+        "RL": np.array([-0.45 * L, 0.0]),
+        "RR": np.array([-0.45 * L, ysep]),
+    }
+
+    if gait.lower() == "trot":
+        phase = {"FL": 0.0, "RR": 0.0, "FR": math.pi, "RL": math.pi}
+    else:
+        phase = {"FL": 0.0, "FR": 0.5 * math.pi, "RR": math.pi, "RL": 1.5 * math.pi}
+
+    return QuadConfig(
+        p=p,
+        cyc=cyc,
+        mount=mount,
+        phase=phase,
+        com_base=0.7 * p.l,
+        com_bob_gain=2.0,
+    )
+
+
+def simulate_quad(cfg: QuadConfig, *, n_steps: int = 900, n_cycles: float = 2.5) -> QuadSim:
+    T = n_steps
+    t = np.linspace(0.0, n_cycles, T)
+    theta = 2.0 * math.pi * t
+
+    body_x = np.zeros(T)
+    com_xy = np.zeros((T, 2))
+    B_world = {leg: np.zeros((T, 2)) for leg in cfg.mount.keys()}
+
+    anchor_x: Dict[LegName, Optional[float]] = {k: None for k in cfg.mount.keys()}
+    prev_stance: Dict[LegName, bool] = {k: False for k in cfg.mount.keys()}
+    com_y_prev = cfg.com_base
+
+    for i in range(T):
+        stance_legs: List[LegName] = []
+        B_loc: Dict[LegName, np.ndarray] = {}
+        C_loc: Dict[LegName, np.ndarray] = {}
+        stance_now: Dict[LegName, bool] = {}
+
+        for leg in cfg.mount.keys():
+            phi_leg = float(theta[i] + cfg.phase[leg])
+            B, C, st = lookup(cfg.cyc, phi_leg)
+            B_loc[leg] = B
+            C_loc[leg] = C
+            stance_now[leg] = st
+            if st:
+                stance_legs.append(leg)
+
+        for leg in cfg.mount.keys():
+            if stance_now[leg] and not prev_stance[leg]:
+                bx_prev = body_x[i - 1] if i > 0 else 0.0
+                foot_x = bx_prev + cfg.mount[leg][0] + C_loc[leg][0]
+                anchor_x[leg] = float(foot_x)
+            if (not stance_now[leg]) and prev_stance[leg]:
+                anchor_x[leg] = None
+            prev_stance[leg] = stance_now[leg]
+
+        if stance_legs:
+            candidates = []
+            for leg in stance_legs:
+                ax = anchor_x[leg]
+                if ax is None:
+                    continue
+                candidates.append(ax - cfg.mount[leg][0] - C_loc[leg][0])
+            body_x[i] = float(np.mean(candidates)) if candidates else (body_x[i - 1] if i > 0 else 0.0)
+
+            mean_cy = float(np.mean([C_loc[leg][1] for leg in stance_legs]))
+            com_y_prev = cfg.com_base - cfg.com_bob_gain * mean_cy
+
+        else:
+            if i >= 2:
+                body_x[i] = body_x[i - 1] + (body_x[i - 1] - body_x[i - 2])
+            elif i == 1:
+                body_x[i] = body_x[i - 1]
+            else:
+                body_x[i] = 0.0
+
+        com_xy[i] = np.array([body_x[i], com_y_prev])
+
+        for leg in cfg.mount.keys():
+            B_world[leg][i] = np.array([body_x[i], 0.0]) + cfg.mount[leg] + B_loc[leg]
+
+    return QuadSim(t=t, body_x=body_x, com_xy=com_xy, B_world=B_world)
+
+def plot_knees_and_com(cfg: QuadConfig, sim: QuadSim, *, outfile: str = "kneesB_com.pdf") -> None:
+    fig, ax = plt.subplots(figsize=(10, 6.5))
+
+    for leg, pts in sim.B_world.items():
+        ax.plot(pts[:, 0], pts[:, 1], linewidth=1.5, label=f"{leg} knee $B$")
+
+    ax.plot(sim.com_xy[:, 0], sim.com_xy[:, 1], linewidth=2.5, label="COM (proxy)")
+
+    allx = np.hstack([sim.com_xy[:, 0]] + [sim.B_world[k][:, 0] for k in sim.B_world.keys()])
+    ally = np.hstack([sim.com_xy[:, 1]] + [sim.B_world[k][:, 1] for k in sim.B_world.keys()])
+
+    # Ignore extreme outliers that wreck the axis
+    xlo, xhi = np.nanquantile(allx, [0.002, 0.998])
+    ylo, yhi = np.nanquantile(ally, [0.01, 0.99])
+
+    padx = 0.03 * (xhi - xlo + 1e-12)
+    pady = 0.15 * (yhi - ylo + 1e-12)
+
+    ax.set_xlim(xlo - padx, xhi + padx)
+    ax.set_ylim(ylo - pady, yhi + pady)
+
+    ax.set_aspect("auto")
+    ax.set_xlabel(r"Forward position $x$ (world)")
+    ax.set_ylabel(r"Vertical position $y$ (world)")
+    ax.set_title(r"Knee joint trajectories ($B$) for four legs with COM path")
+    ax.legend(ncol=3, fontsize=9, loc="upper right")
+
+    fig.tight_layout()
+    fig.savefig(outfile)
+    plt.close(fig)
+
+
+def main():
+    p = LinkageParams(a=1.13, b=1.32, c=1.20, d=1.46, l=1.0)
+    cfg = make_quad(p, gait="walk", branch=+1, Ncycle=2500)
+    sim = simulate_quad(cfg, n_steps=900, n_cycles=2.5)
+    plot_knees_and_com(cfg, sim, outfile="kneesB_com.pdf")
+    print("Wrote kneesB_com.pdf")
+
+
+if __name__ == "__main__":
+    main()
